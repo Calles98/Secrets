@@ -1,78 +1,206 @@
 //jshint esversion:6
-require('dotenv').config()
+require("dotenv").config();
 const express = require("express");
 const bodyParser = require("body-parser");
+const mongoose = require("mongoose");
 const ejs = require("ejs");
-const mongoose = require('mongoose');
-const encrypt = require("mongoose-encryption");  
-
-
-mongoose.set("strictQuery", false);
-mongoose.connect("mongodb://localhost:27017/userDB", {UseNewUrlParser: true}); 
-
+const session = require("express-session");
+const passport = require("passport");
+const passportLocalMongoose = require("passport-local-mongoose");
+const GoogleStrategy = require("passport-google-oauth20").Strategy;
+const findOrCreate = require("mongoose-findorcreate");
+const { nextTick } = require("process");
+const { log } = require("console");
+ 
 const app = express();
-app.set('view engine', 'ejs');
-app.use(bodyParser.urlencoded({extended: true}));
-
-// USER SCHEMA
-
+ 
+app.use(express.static("public"));
+app.set("view engine", "ejs");
+app.use(bodyParser.urlencoded({ extended: true }));
+ 
+app.use(
+  session({
+    secret: "Our little secret.",
+    resave: false,
+    saveUninitialized: false,
+  })
+);
+ 
+app.use(passport.initialize());
+app.use(passport.session());
+ 
+mongoose.set("strictQuery", true);
+ 
+mongoose.connect(
+  "mongodb://127.0.0.1:27017/userDB",
+  {
+    useNewUrlParser: true,
+  },
+  console.log("connected to mongoDB")
+);
+ 
 const userSchema = new mongoose.Schema({
-    email: String, 
-    password: String
+  email: String,
+  password: String,
+  googleId: String,
+  secret: String
 });
-
-
-userSchema.plugin(encrypt, {secret: process.env.SECRET, encryptedFields: ['password']}); 
-
-const User = mongoose.model("User", userSchema); 
-
-// HTTP requests
-
-app.get("/", (req,res)=>{
-    res.render("home"); 
+ 
+userSchema.plugin(passportLocalMongoose);
+userSchema.plugin(findOrCreate);
+ 
+const User = new mongoose.model("User", userSchema);
+ 
+passport.use(User.createStrategy());
+ 
+passport.serializeUser(function (user, cb) {
+  process.nextTick(function () {
+    cb(null, { id: user.id, username: user.username, name: user.name });
+  });
 });
-
-app.get("/register", (req,res)=>{
-    res.render("register"); 
+ 
+passport.deserializeUser(function (user, cb) {
+  process.nextTick(function () {
+    return cb(null, user);
+  });
 });
-
-app.get("/login", (req,res)=>{
-    res.render("login"); 
-});
-
-app.post("/register", async (req,res)=>{
-    const newUser = new User({email: req.body.username, password: req.body.password});
-    try {
-        
-        await newUser.save(); 
-        res.render("Secrets"); 
-        
-    } catch (error) {
-        console.log(error); 
-        
+ 
+passport.use(
+  new GoogleStrategy(
+    {
+      clientID: process.env.CLIENT_ID,
+      clientSecret: process.env.CLIENT_SECRET,
+ 
+      callbackURL: "http://localhost:3000/auth/google/secrets",
+      userProfileURL: "https://www.googleapis.com/oauth2/v3/userinfo",
+    },
+    function (accessToken, refreshToken, profile, cb) {
+      console.log(profile);
+ 
+      User.findOne({googleId: profile.id})
+        .then((founduser)=>{
+            if(!founduser){  //if no foundUser , we create one
+            const newUser = new User({
+                username: profile.displayName,
+                googleId: profile.id
+            })
+            newUser.save() //save the User and then send back the newly created user
+            .then(() => {
+                cb(null, newUser)
+            })
+            .catch((err)=>{
+                cb(err)
+            })
+            } else { //if user already exist, just send back the user
+            cb(null, founduser)
+            }
+        })
+        .catch((err)=>{
+            cb(err)
+        })
     }
-}); 
+));
 
-app.post("/login", async(req,res)=>{
-    const username = req.body.username; 
-    const password = req.body.password; 
+ 
+app.get("/", function (req, res) {
+  res.render("home");
+});
+ 
+app.get(
+  "/auth/google",
+  passport.authenticate("google", { scope: ["profile"] })
+);
+ 
+app.get(
+  "/auth/google/secrets",
+  passport.authenticate("google", { failureRedirect: "/login" }),
+  function (req, res) {
+    res.redirect("/secrets");
+  }
+);
+ 
+app.get("/login", function (req, res) {
+  res.render("login");
+});
+ 
+app.get("/register", function (req, res) {
+  res.render("register");
+});
+ 
+app.get("/secrets", async function (req, res) {
+    const foundUsers = await User.find({"secret": {$ne: null}}); 
     try {
-       const foundUser = await User.findOne({email: username}); 
-        if(foundUser){
-            if(foundUser.password === password){
-                res.render("secrets");
-            } else{
-                res.render("register"); 
-            } 
-        }else{
-            res.render("register")
-        }
-    } catch (error) {
-        console.log(error);
+        res.render("secrets", {usersWithSecret: foundUsers})
+    } catch (err) {
+        console.log(err);
     }
+});
+
+app.get("/submit", (req, res)=>{
+    if (req.isAuthenticated()) {
+        res.render("submit");
+      } else {
+        res.redirect("/login");
+      }
 }); 
+ 
+app.get("/logout", function (req, res) {
+  req.logout(function (err) {
+    if (err) {
+      return nextTick(err);
+    }
+    res.redirect("/");
+  });
+});
+ 
+app.post("/register", function (req, res) {
+  User.register(
+    { username: req.body.username },
+    req.body.password,
+    function (err, user) {
+      if (err) {
+        console.log(err);
+        res.redirect("/register");
+      } else {
+        passport.authenticate("local")(req, res, function () {
+          res.redirect("/secrets");
+        });
+      }
+    }
+  );
+});
+ 
+app.post("/login", function (req, res) {
+  const user = new User({
+    username: req.body.username,
+    password: req.body.password,
+  });
+ 
+  req.login(user, function (err) {
+    if (err) {
+      console.log(err);
+    } else {
+      passport.authenticate("local")(req, res, function () {
+        res.redirect("/secrets");
+      });
+    }
+  });
+});
 
+app.post("/submit", async (req,res)=>{
+    const submittedSecret = req.body.secret; 
 
-app.listen(3000, ()=>{
-    console.log("Listening on port 3000...");
+    const foundUser = await User.findById(req.user.id); 
+    try {
+        foundUser.secret = submittedSecret; 
+        const savedData = await foundUser.save(); 
+        res.redirect("/secrets"); 
+    } catch (err) {
+        console.log(err);
+    }
+               
+}); 
+ 
+app.listen("3000", function () {
+  console.log("Connected at port 3000");
 });
